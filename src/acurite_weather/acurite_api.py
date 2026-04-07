@@ -1,12 +1,13 @@
-"""MyAcurite API client for marapi.myacurite.com."""
+"""MyAcurite API client for marapi.myacurite.com and dataapi.myacurite.com."""
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, date, timedelta, timezone
 
 import httpx
 
 
 BASE_URL = "https://marapi.myacurite.com"
+DATA_URL = "https://dataapi.myacurite.com/mar-sensor-readings"
 TOKEN_MAX_AGE = 5 * 3600  # refresh after 5 hours
 
 HEADERS = {
@@ -20,6 +21,22 @@ CARDINAL_DIRS = [
     "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
     "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
 ]
+
+# Channel number -> (field_name, unit_key) for dataapi responses
+CHANNEL_MAP = {
+    "1": ("temperature_f", "F"),
+    "2": ("humidity_pct", "RH"),
+    "3": ("wind_speed_mph", "MPH"),
+    "4": ("wind_direction_deg", ""),
+    "5": ("feels_like_f", "F"),
+    "6": ("dew_point_f", "F"),
+    "7": ("heat_index_f", "F"),
+    "8": ("wind_chill_f", "F"),
+    "9": ("pressure_inhg", "INHG"),
+    "10": ("rainfall_hourly_in", "IN"),
+    "11": ("rainfall_daily_in", "IN"),
+    "12": ("wind_speed_avg_mph", "MPH"),
+}
 
 
 def degrees_to_cardinal(deg: float) -> str:
@@ -35,6 +52,7 @@ class AcuriteClient:
         self.token: str | None = None
         self.account_id: str | None = None
         self.token_time: float = 0
+        self._device_path: str | None = None  # cached dataapi path
         self._client = httpx.Client(timeout=30, headers=HEADERS)
 
     def login(self):
@@ -74,7 +92,7 @@ class AcuriteClient:
         return self._request("GET", f"/accounts/{self.account_id}/dashboard/hubs/{hub_id}")
 
     def _find_hub_and_device(self) -> tuple[str, dict]:
-        """Find the hub and device matching device_mac, or return the first one."""
+        """Find the hub and device, cache the dataapi path."""
         hubs = self.get_hubs()
         if not hubs:
             raise ValueError("No hubs found on your MyAcurite account")
@@ -85,9 +103,11 @@ class AcuriteClient:
             for device in devices:
                 if self.device_mac:
                     mac = device.get("mac_address", "")
-                    if mac.upper() == self.device_mac.upper():
+                    if mac and mac.upper() == self.device_mac.upper():
+                        self._cache_device_path(device)
                         return str(hub["id"]), device
                 else:
+                    self._cache_device_path(device)
                     return str(hub["id"]), device
 
         if self.device_mac:
@@ -96,6 +116,20 @@ class AcuriteClient:
                 f"Available hubs: {[h.get('name', h['id']) for h in hubs]}"
             )
         raise ValueError("No devices found")
+
+    def _cache_device_path(self, device: dict):
+        """Extract the dataapi device path from meta_file URL."""
+        meta = device.get("meta_file", "")
+        if meta and "/mar-sensor-readings/" in meta:
+            # URL like https://dataapi.myacurite.com/mar-sensor-readings/XXXX/meta.json
+            path = meta.split("/mar-sensor-readings/")[1]
+            self._device_path = path.rsplit("/", 1)[0]  # strip /meta.json
+
+    def _ensure_device_path(self):
+        if not self._device_path:
+            self._find_hub_and_device()
+        if not self._device_path:
+            raise ValueError("Could not determine device data path")
 
     def _parse_sensors(self, device: dict) -> dict:
         """Parse sensor array into a clean dict."""
@@ -120,46 +154,41 @@ class AcuriteClient:
                     pass
             sensor_map[code] = {"value": value, "unit": unit}
 
-        # Map known sensor codes to clean field names
         field_mappings = {
-            "Temperature": ("temperature_f", None),
-            "Humidity": ("humidity_pct", None),
-            "Dew Point": ("dew_point_f", None),
-            "Wind Speed": ("wind_speed_mph", None),
-            "Wind Speed Avg": ("wind_speed_avg_mph", None),
-            "WindSpeedAvg": ("wind_speed_avg_mph", None),
-            "Wind Direction": ("wind_direction_deg", None),
-            "Barometric Pressure": ("pressure_inhg", None),
-            "Rainfall": ("rainfall_in", None),
-            "Heat Index": ("heat_index_f", None),
-            "Wind Chill": ("wind_chill_f", None),
-            "Feels Like": ("feels_like_f", None),
+            "Temperature": "temperature_f",
+            "Humidity": "humidity_pct",
+            "Dew Point": "dew_point_f",
+            "Wind Speed": "wind_speed_mph",
+            "Wind Speed Avg": "wind_speed_avg_mph",
+            "WindSpeedAvg": "wind_speed_avg_mph",
+            "Wind Direction": "wind_direction_deg",
+            "Barometric Pressure": "pressure_inhg",
+            "Rainfall": "rainfall_in",
+            "Heat Index": "heat_index_f",
+            "Wind Chill": "wind_chill_f",
+            "Feels Like": "feels_like_f",
         }
 
-        for sensor_code, (field_name, _) in field_mappings.items():
+        for sensor_code, field_name in field_mappings.items():
             if sensor_code in sensor_map:
                 readings[field_name] = sensor_map[sensor_code]["value"]
 
-        # Add wind direction cardinal
         if "wind_direction_deg" in readings and readings["wind_direction_deg"] is not None:
             readings["wind_direction_cardinal"] = degrees_to_cardinal(readings["wind_direction_deg"])
 
-        # Store raw sensor map for debugging
         readings["_raw_sensors"] = {k: v["value"] for k, v in sensor_map.items()}
-
         return readings
 
+    # --- Live data (marapi) ---
+
     def get_current_conditions(self) -> dict:
-        """Get current weather conditions from the station."""
         hub_id, device = self._find_hub_and_device()
         return self._parse_sensors(device)
 
     def get_device_info(self) -> dict:
-        """Get device metadata."""
         hub_id, device = self._find_hub_and_device()
         hubs = self.get_hubs()
         hub_name = next((h.get("name", "") for h in hubs if str(h["id"]) == hub_id), "")
-
         return {
             "device_name": device.get("name", ""),
             "mac_address": device.get("mac_address", ""),
@@ -171,14 +200,84 @@ class AcuriteClient:
             "firmware": device.get("firmware_version", ""),
         }
 
-    def get_all_hub_data(self) -> dict:
-        """Get full raw hub data for discovery/debugging."""
-        hubs = self.get_hubs()
-        result = {}
-        for hub in hubs:
-            hub_id = str(hub["id"])
-            result[hub_id] = {
-                "name": hub.get("name", ""),
-                "data": self.get_hub_data(hub_id),
-            }
-        return result
+    # --- Historical data (dataapi) ---
+
+    def _fetch_day_data(self, day: date, resolution: str = "1h-summaries") -> dict:
+        """Fetch one day of historical data from dataapi.myacurite.com.
+
+        resolution: '5m-summaries', '15m-summaries', or '1h-summaries'
+        Returns raw channel data dict.
+        """
+        self._ensure_device_path()
+        url = f"{DATA_URL}/{self._device_path}/{resolution}/{day.isoformat()}.json"
+        resp = self._client.get(url)
+        if resp.status_code == 404:
+            return {}
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_history(
+        self,
+        start: date,
+        end: date,
+        resolution: str = "auto",
+    ) -> list[dict]:
+        """Get historical readings for a date range.
+
+        Returns a list of dicts with timestamp + all sensor fields.
+        Resolution auto-selects based on range:
+          <= 2 days: 5m, <= 7 days: 15m, else: 1h
+        """
+        days = (end - start).days + 1
+        if resolution == "auto":
+            if days <= 2:
+                resolution = "5m-summaries"
+            elif days <= 7:
+                resolution = "15m-summaries"
+            else:
+                resolution = "1h-summaries"
+
+        readings = []
+        current = start
+        while current <= end:
+            day_data = self._fetch_day_data(current, resolution)
+            if day_data:
+                readings.extend(self._parse_day_data(day_data))
+            current += timedelta(days=1)
+
+        readings.sort(key=lambda r: r["timestamp"])
+        return readings
+
+    def _parse_day_data(self, day_data: dict) -> list[dict]:
+        """Parse dataapi channel data into flat reading dicts."""
+        # Build timestamp -> readings map
+        by_time: dict[str, dict] = {}
+
+        for channel_str, (field_name, unit_key) in CHANNEL_MAP.items():
+            entries = day_data.get(channel_str, [])
+            for entry in entries:
+                ts = entry.get("happened_at", "")
+                raw = entry.get("raw_values", {})
+
+                # Pick the right unit value
+                if unit_key and unit_key in raw:
+                    value = raw[unit_key]
+                elif raw:
+                    # For wind direction, key might be empty string or first available
+                    value = next(iter(raw.values()))
+                else:
+                    continue
+
+                if ts not in by_time:
+                    by_time[ts] = {"timestamp": ts}
+                by_time[ts][field_name] = value
+
+        return list(by_time.values())
+
+    def get_meta(self) -> dict:
+        """Get all-time records from meta.json."""
+        self._ensure_device_path()
+        url = f"{DATA_URL}/{self._device_path}/meta.json"
+        resp = self._client.get(url)
+        resp.raise_for_status()
+        return resp.json()
