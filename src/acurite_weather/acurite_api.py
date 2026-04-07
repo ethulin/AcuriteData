@@ -249,8 +249,12 @@ class AcuriteClient:
         return readings
 
     def _parse_day_data(self, day_data: dict) -> list[dict]:
-        """Parse dataapi channel data into flat reading dicts."""
-        # Build timestamp -> readings map
+        """Parse dataapi channel data into flat reading dicts.
+
+        Rainfall (channel 11) is a cumulative daily gauge that resets around
+        07:00 UTC (midnight Pacific). We compute incremental rainfall from
+        consecutive readings to avoid double-counting across the UTC reset.
+        """
         by_time: dict[str, dict] = {}
 
         for channel_str, (field_name, unit_key) in CHANNEL_MAP.items():
@@ -259,11 +263,9 @@ class AcuriteClient:
                 ts = entry.get("happened_at", "")
                 raw = entry.get("raw_values", {})
 
-                # Pick the right unit value
                 if unit_key and unit_key in raw:
                     value = raw[unit_key]
                 elif raw:
-                    # For wind direction, key might be empty string or first available
                     value = next(iter(raw.values()))
                 else:
                     continue
@@ -273,6 +275,55 @@ class AcuriteClient:
                 by_time[ts][field_name] = value
 
         return list(by_time.values())
+
+    def get_daily_rainfall(self, start: date, end: date) -> dict[str, float]:
+        """Get actual daily rainfall totals, correctly handling cumulative resets.
+
+        Channel 11 is a cumulative gauge that resets at ~07:00 UTC (midnight
+        Pacific). The true daily total for a local day is the max value seen
+        between 07:00 UTC on that day and 07:00 UTC the next day.
+
+        Returns dict of {local_date_str: rainfall_inches}.
+        """
+        # Fetch one extra day on each side for the UTC/Pacific boundary
+        fetch_start = start - timedelta(days=1)
+        fetch_end = end + timedelta(days=1)
+
+        # Collect all channel 11 readings with timestamps
+        all_readings: list[tuple[str, float]] = []
+        current = fetch_start
+        while current <= fetch_end:
+            raw = self._fetch_day_data(current, "1h-summaries")
+            for entry in raw.get("11", []):
+                ts = entry.get("happened_at", "")
+                val = entry.get("raw_values", {}).get("IN")
+                if ts and val is not None:
+                    all_readings.append((ts, val))
+            current += timedelta(days=1)
+
+        all_readings.sort(key=lambda x: x[0])
+
+        # Group by local day (Pacific = UTC-7 roughly; reset is at ~07:00 UTC)
+        # A "local day" runs from 07:00 UTC to 06:59 UTC next day
+        daily_rain: dict[str, float] = {}
+        for ts, val in all_readings:
+            # Parse hour from timestamp to determine local date
+            try:
+                dt = datetime.fromisoformat(ts)
+                # Shift by -7 hours to approximate Pacific time
+                local_dt = dt - timedelta(hours=7)
+                local_date = local_dt.date().isoformat()
+            except (ValueError, TypeError):
+                continue
+
+            if local_date not in daily_rain:
+                daily_rain[local_date] = 0.0
+            # The daily gauge is cumulative; the max value is the day's total
+            daily_rain[local_date] = max(daily_rain[local_date], val)
+
+        # Filter to requested range
+        return {d: round(v, 2) for d, v in daily_rain.items()
+                if start.isoformat() <= d <= end.isoformat()}
 
     def get_meta(self) -> dict:
         """Get all-time records from meta.json."""

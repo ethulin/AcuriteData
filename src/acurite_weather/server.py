@@ -84,23 +84,38 @@ def query_history(
         start_date = start_dt.date()
         end_date = end_dt.date()
 
+        # Rainfall uses a special method that handles cumulative gauge resets
+        if metric == "rainfall":
+            daily_rain = client.get_daily_rainfall(start_date, end_date)
+            data = [{"date": d, "value": v} for d, v in sorted(daily_rain.items())]
+            values = [d["value"] for d in data]
+            summary = {
+                "count": len(values),
+                "total_in": round(sum(values), 2),
+                "max_daily_in": round(max(values), 2) if values else 0,
+                "rainy_days": sum(1 for v in values if v > 0.01),
+            }
+            return {
+                "query": {"start": start_date.isoformat(), "end": end_date.isoformat(),
+                          "metric": "rainfall", "points": len(data)},
+                "summary": summary,
+                "data": data,
+            }
+
         field = _metric_field(metric)
         res_map = {"raw": "5m-summaries", "15m": "15m-summaries", "hourly": "1h-summaries"}
         resolution = res_map.get(aggregation, "auto")
 
         history = client.get_history(start_date, end_date, resolution)
 
-        # Extract the metric values
         data = []
         for r in history:
             ts = r.get("timestamp", "")
             val = r.get(field)
             if val is not None:
-                # Filter to requested time range
                 if ts >= start_dt.isoformat() and ts <= end_dt.isoformat() + "T23:59:59":
                     data.append({"timestamp": ts, "value": val})
 
-        # Compute summary
         values = [d["value"] for d in data if isinstance(d["value"], (int, float))]
         summary = {}
         if values:
@@ -112,23 +127,15 @@ def query_history(
                 "first": values[0],
                 "last": values[-1],
             }
-            if metric == "rainfall":
-                summary["sum"] = round(sum(values), 2)
 
-        # If daily aggregation, aggregate by date
         if aggregation == "daily" and data:
             data = _aggregate_daily(data, stat or "auto", metric)
 
         return {
-            "query": {
-                "start": start_date.isoformat(),
-                "end": end_date.isoformat(),
-                "metric": metric,
-                "field": field,
-                "points": len(data),
-            },
+            "query": {"start": start_date.isoformat(), "end": end_date.isoformat(),
+                      "metric": metric, "field": field, "points": len(data)},
             "summary": summary,
-            "data": data[:500],  # cap to avoid huge responses
+            "data": data[:500],
         }
     except Exception as e:
         return {"error": str(e)}
@@ -169,11 +176,14 @@ def get_records_and_extremes(
             elif m == "pressure":
                 result["pressure"] = _extremes(history, "pressure_inhg", "inHg")
             elif m == "rainfall":
-                vals = [r.get("rainfall_daily_in", 0) for r in history
-                        if r.get("rainfall_daily_in") is not None]
-                if vals:
+                daily_rain = client.get_daily_rainfall(start_date, end_date)
+                rain_vals = list(daily_rain.values())
+                if rain_vals:
                     result["rainfall"] = {
-                        "max_daily_in": round(max(vals), 2),
+                        "total_in": round(sum(rain_vals), 2),
+                        "max_daily_in": round(max(rain_vals), 2),
+                        "rainy_days": sum(1 for v in rain_vals if v > 0.01),
+                        "by_day": daily_rain,
                     }
 
         return result
@@ -267,7 +277,8 @@ def check_thresholds(
 
         temps = [r["temperature_f"] for r in recent if r.get("temperature_f") is not None]
         winds = [r["wind_speed_mph"] for r in recent if r.get("wind_speed_mph") is not None]
-        rains = [r["rainfall_daily_in"] for r in recent if r.get("rainfall_daily_in") is not None]
+        daily_rain = client.get_daily_rainfall(start_date, end_date)
+        rain_total = sum(daily_rain.values())
 
         standard = {
             "freeze_occurred": bool(temps and min(temps) <= 32),
@@ -276,7 +287,7 @@ def check_thresholds(
             "max_temp_f": round(max(temps), 1) if temps else None,
             "high_wind_occurred": bool(winds and max(winds) > 25),
             "max_wind_mph": round(max(winds), 1) if winds else None,
-            "max_rain_daily_in": round(max(rains), 2) if rains else None,
+            "rain_total_in": round(rain_total, 2),
             "data_points": len(recent),
         }
 
@@ -326,16 +337,12 @@ def get_agricultural_data(
 
         # Group by date for daily high/low
         by_date: dict[str, list[float]] = {}
-        rain_by_date: dict[str, float] = {}
         for r in history:
             ts = r.get("timestamp", "")
             d = ts[:10]
             temp = r.get("temperature_f")
             if temp is not None:
                 by_date.setdefault(d, []).append(temp)
-            rain = r.get("rainfall_daily_in")
-            if rain is not None:
-                rain_by_date[d] = max(rain_by_date.get(d, 0), rain)
 
         # GDD calculation
         total_gdd = 0
@@ -352,7 +359,8 @@ def get_agricultural_data(
             if low <= 32:
                 frost_dates.append(d)
 
-        # Rain summary
+        # Rain summary (using correct daily rainfall method)
+        rain_by_date = client.get_daily_rainfall(start_date, end_date)
         rain_by_month: dict[str, float] = {}
         for d, rain in rain_by_date.items():
             month = d[:7]
