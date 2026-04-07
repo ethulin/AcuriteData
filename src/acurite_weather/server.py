@@ -11,8 +11,8 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-from acurite_api import AcuriteClient
-from derived import (
+from acurite_weather.acurite_api import AcuriteClient
+from acurite_weather.derived import (
     enrich_conditions,
     growing_degree_days,
     pressure_trend_description,
@@ -422,5 +422,9 @@ def _compare(value: float, op: str, threshold: float) -> bool:
     return ops.get(op, lambda a, b: False)(value, threshold)
 
 
-if __name__ == "__main__":
+def main():
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
